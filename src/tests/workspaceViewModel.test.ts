@@ -1,8 +1,27 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { analyzeRules } from '../domain/ruleAnalysis';
 import type { RuleProject, WorkspaceDocument } from '../models/ruleModel';
-import type { CheckOperation } from '../services/ruleCheckService';
+import { RuleCheckService, type CheckOperation } from '../services/ruleCheckService';
 import { RuleWorkspaceViewModel } from '../viewmodels/workspaceViewModel';
+
+class FakeWorker {
+  onmessage: ((event: MessageEvent) => void) | null = null;
+  onerror: ((event: ErrorEvent) => void) | null = null;
+  terminated = false;
+  posted: unknown[] = [];
+
+  postMessage(message: unknown): void {
+    this.posted.push(message);
+  }
+
+  terminate(): void {
+    this.terminated = true;
+  }
+
+  respond(data: unknown): void {
+    this.onmessage?.({ data } as MessageEvent);
+  }
+}
 
 class MemoryRepository {
   document: WorkspaceDocument | null = null;
@@ -79,6 +98,47 @@ describe('RuleWorkspaceViewModel', () => {
     await workspace.runCheck();
     expect(workspace.getSnapshot().checkStatus).toBe('error');
     expect(checker.calls).toBe(callsBefore);
+    workspace.dispose();
+  });
+
+  it('auto-fails a stuck check, returns to a runnable state, and isolates the next run', async () => {
+    const workers: FakeWorker[] = [];
+    const service = new RuleCheckService({
+      timeoutMs: 1000,
+      workerFactory: () => {
+        const worker = new FakeWorker();
+        workers.push(worker);
+        return worker as unknown as Worker;
+      },
+    });
+    const workspace = new RuleWorkspaceViewModel(new MemoryRepository(), service);
+    await workspace.start();
+    await vi.advanceTimersByTimeAsync(50);
+    expect(workspace.getSnapshot().checkStatus).toBe('checking');
+
+    // 第一次计算卡住：超时后自动失败，界面回到可重新发起的状态
+    await vi.advanceTimersByTimeAsync(1000);
+    const stuck = workspace.getSnapshot();
+    expect(stuck.checkStatus).toBe('error');
+    expect(stuck.phase).toBe('error');
+    expect(stuck.notice).toContain('超时');
+    expect(workers[0].terminated).toBe(true);
+
+    // 重新发起使用全新的计算，不受上一次影响
+    const project = workspace.getSnapshot().project as RuleProject;
+    const expected = analyzeRules(project);
+    const rerun = workspace.runCheck();
+    expect(workers).toHaveLength(2);
+    const request = workers[1].posted[0] as { requestId: number };
+    workers[1].respond({ requestId: request.requestId, analysis: expected });
+    await rerun;
+    expect(workspace.getSnapshot().checkStatus).toBe('success');
+    expect(workspace.getSnapshot().analysis).toBe(expected);
+
+    // 上一次残留的迟到结果不会覆盖本次结果
+    workers[0].respond({ requestId: 1, analysis: { checkedCases: 999 } });
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(workspace.getSnapshot().analysis).toBe(expected);
     workspace.dispose();
   });
 

@@ -1,10 +1,5 @@
-import type { RuleProject } from '../models/ruleModel';
+import type { CheckRequest } from './ruleCheckService';
 import { analyzeRules } from '../domain/ruleAnalysis';
-
-interface CheckRequest {
-  requestId: number;
-  project: RuleProject;
-}
 
 self.onmessage = (event: MessageEvent<CheckRequest>) => {
   try {
