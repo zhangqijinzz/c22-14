@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { analyzeRules } from '../domain/ruleAnalysis';
-import type { RuleProject, WorkspaceDocument } from '../models/ruleModel';
-import type { CheckOperation } from '../services/ruleCheckService';
+import type { RuleAnalysis, RuleProject, WorkspaceDocument } from '../models/ruleModel';
+import { RuleCheckTimeoutError, type CheckOperation } from '../services/ruleCheckService';
 import { RuleWorkspaceViewModel } from '../viewmodels/workspaceViewModel';
 
 class MemoryRepository {
@@ -25,6 +25,29 @@ class FakeChecker {
     return { promise: Promise.resolve(analyzeRules(project)), cancel: () => { this.cancelled = true; } };
   }
 }
+
+class ManualChecker {
+  operations: { promise: Promise<RuleAnalysis>; resolve: (analysis: RuleAnalysis) => void; cancel: ReturnType<typeof vi.fn> }[] = [];
+
+  run(): CheckOperation {
+    let resolvePromise: (analysis: RuleAnalysis) => void = () => undefined;
+    const promise = new Promise<RuleAnalysis>((resolve) => { resolvePromise = resolve; });
+    const operation = { promise, resolve: resolvePromise, cancel: vi.fn() };
+    this.operations.push(operation);
+    return { promise, cancel: operation.cancel };
+  }
+}
+
+const stubAnalysis: RuleAnalysis = {
+  checkedCases: 0,
+  coveredCases: 0,
+  coveragePercent: 0,
+  overlaps: [],
+  unreachableRuleIds: [],
+  shadowedRuleIds: [],
+  uncoveredExamples: [],
+  truncated: false,
+};
 
 describe('RuleWorkspaceViewModel', () => {
   beforeEach(() => vi.useFakeTimers());
@@ -64,6 +87,43 @@ describe('RuleWorkspaceViewModel', () => {
     await workspace.runCheck();
     expect(workspace.getSnapshot().checkStatus).toBe('success');
     expect(workspace.getSnapshot().analysis).not.toBeNull();
+    workspace.dispose();
+  });
+
+  it('ends a stuck check with a timeout failure and allows a fresh rerun', async () => {
+    const repository = new MemoryRepository();
+    const checker = new FakeChecker();
+    const workspace = new RuleWorkspaceViewModel(repository, checker);
+    await workspace.start();
+    checker.nextError = new RuleCheckTimeoutError();
+    await workspace.runCheck();
+    expect(workspace.getSnapshot().phase).toBe('error');
+    expect(workspace.getSnapshot().checkStatus).toBe('error');
+    expect(workspace.getSnapshot().notice).toContain('超时');
+    await workspace.runCheck();
+    expect(workspace.getSnapshot().checkStatus).toBe('success');
+    expect(workspace.getSnapshot().analysis).not.toBeNull();
+    workspace.dispose();
+  });
+
+  it('ignores a late result from a superseded check so two runs never overwrite each other', async () => {
+    const repository = new MemoryRepository();
+    const checker = new ManualChecker();
+    const workspace = new RuleWorkspaceViewModel(repository, checker);
+    await workspace.start();
+    void workspace.runCheck();
+    void workspace.runCheck();
+    const [superseded, current] = checker.operations;
+    expect(superseded.cancel).toHaveBeenCalled();
+
+    current.resolve({ ...stubAnalysis, checkedCases: 222 });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(workspace.getSnapshot().checkStatus).toBe('success');
+    expect(workspace.getSnapshot().analysis?.checkedCases).toBe(222);
+
+    superseded.resolve({ ...stubAnalysis, checkedCases: 111 });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(workspace.getSnapshot().analysis?.checkedCases).toBe(222);
     workspace.dispose();
   });
 
